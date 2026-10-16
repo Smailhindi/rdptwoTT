@@ -1,0 +1,191 @@
+
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Validate Password and Tailscale Key
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Please set RDP_PASSWORD in GitHub Secrets."
+          }
+
+          if ($env:RDP_PASSWORD.Length -lt 12) {
+            throw "RDP password must contain at least 12 characters."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Please set TAILSCALE_AUTH_KEY in GitHub Secrets."
+          }
+
+          Write-Host "Credentials configured successfully."
+
+      - name: Configure Secure RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 2
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+      - name: Create RDP User With Custom Password
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name "RDP" -Password $securePass
+          }
+          else {
+            New-LocalUser `
+              -Name "RDP" `
+              -Password $securePass `
+              -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP user created successfully."
+          Write-Host "Username: RDP"
+          Write-Host "Password: Your configured GitHub Secret"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList @("/i", "`"$installer`"", "/qn", "/norestart") `
+            -Wait -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed."
+          }
+
+          Remove-Item $installer -Force
+
+      - name: Establish Tailscale Connection
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          & $exe up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=$hostname" `
+            --unattended=true
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale authentication failed."
+          }
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 20; $i++) {
+            $tsIP = & $exe ip -4 | Select-Object -First 1
+
+            if ($tsIP) {
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+            throw "Tailscale IP not assigned."
+          }
+
+          Add-Content -Path $env:GITHUB_ENV `
+            -Value "TAILSCALE_IP=$tsIP"
+
+          Write-Host "Tailscale connected: $tsIP"
+
+      - name: Configure Tailscale RDP Firewall
+        shell: pwsh
+        run: |
+          Get-NetFirewallRule -Name 'RemoteDesktop*' `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'RDP-Tailscale-Only' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any
+
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            throw "RDP is not listening on port 3389."
+          }
+
+          Write-Host "RDP service is listening."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+      - name: Maintain RDP Connection
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "================================="
+          Write-Host "       RDP IS READY"
+          Write-Host "================================="
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Your chosen password"
+          Write-Host "================================="
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active"
+            Start-Sleep -Seconds 300
+          }
